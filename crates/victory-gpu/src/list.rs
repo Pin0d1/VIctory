@@ -1162,19 +1162,31 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let address = crate::resource::buffer_bytes(arguments).and_then(|(p, size)| {
+        offset.is_multiple_of(4).then_some(())?;
+        Some(((p as u64).checked_add(offset)?, size.checked_sub(offset)?))
+    });
+    let counter = crate::resource::buffer_bytes(count).and_then(|(p, size)| {
+        (count_offset.is_multiple_of(4) && count_offset.checked_add(4)? <= size).then_some(())?;
+        (p as u64).checked_add(count_offset)
+    });
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if let ([[kind, ..]], Some((address, available))) = (args, address)
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
-        });
+        let kind = if *kind == DISPATCH_SINGLE {
+            DISPATCH
+        } else {
+            *kind
+        };
+        if crate::indirect::Layout::new(kind, stride, max).is_some_and(|l| l.span() <= available) {
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            });
+        }
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
@@ -1195,7 +1207,7 @@ extern "system" fn execute_indirect(
             stride,
             ?args,
             max,
-            address = ?address.map(|a| format!("{a:#x}")),
+            address = ?address.map(|(a, _)| format!("{a:#x}")),
             counted = !count.is_null(),
             "indirect execution dropped (first time for this signature)"
         );

@@ -236,3 +236,7 @@ mod tests {
         assert!(matches!(p.made.get(), Some(None)));
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "indirect_tests.rs"]
+mod indirect_tests;
