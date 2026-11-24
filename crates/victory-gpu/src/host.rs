@@ -298,9 +298,12 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
-    /// The work its indirect executions may still do (`indirect`): a
-    /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Per-execution work tally and its immutable zero upload.
+    budget: OnceLock<Option<(ID3D12Resource, ID3D12Resource)>>,
+    /// Private argument storage reused in GPU command order, grown on demand.
+    pub(crate) indirect_scratch: Mutex<Option<ID3D12Resource>>,
+    /// Explicit states of shadow buffers in this list. Lists start and end in COMMON.
+    shadow_states: Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -481,6 +484,8 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                indirect_scratch: Mutex::default(),
+                shadow_states: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -494,6 +499,26 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        if runs.len() > 1 {
+            // A repeated native list (including its prelude and scratch) can only
+            // be submitted again after its preceding execution has completed.
+            let mut seen = std::collections::HashSet::new();
+            let mut start = 0;
+            for (i, &list) in runs.iter().enumerate() {
+                if !seen.insert(list.list.as_raw()) {
+                    self.execute_group(&runs[start..i], &mut submitted);
+                    seen.clear();
+                    seen.insert(list.list.as_raw());
+                    start = i;
+                }
+            }
+            self.execute_group(&runs[start..], &mut submitted);
+        } else if !runs.is_empty() {
+            self.execute_group(runs, &mut submitted);
+        }
+    }
+
+    fn execute_group(&self, runs: &[&HostList], submitted: &mut u64) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -859,7 +884,42 @@ impl HostList {
         times
     }
 
+    /// Moves a host copy to its next use and returns the previous state.
+    /// Reads share GENERIC_READ so an argument buffer may also supply vertex data.
+    pub(crate) fn shadow_state(
+        &self,
+        buffer: &ID3D12Resource,
+        wanted: D3D12_RESOURCE_STATES,
+    ) -> D3D12_RESOURCE_STATES {
+        let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, state) = states
+            .entry(buffer.as_raw() as usize)
+            .or_insert_with(|| (buffer.clone(), D3D12_RESOURCE_STATE_COMMON));
+        let before = std::mem::replace(state, wanted);
+        if before != wanted {
+            // SAFETY: an open list; the map retains the buffer.
+            unsafe {
+                self.list
+                    .ResourceBarrier(&[transition(buffer, before, wanted)])
+            };
+        }
+        before
+    }
+
     pub(crate) fn close(&self) {
+        // A submission can batch several lists without decay between them.
+        let barriers: Vec<_> = self
+            .shadow_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|(_, state)| *state != D3D12_RESOURCE_STATE_COMMON)
+            .map(|(buffer, state)| transition(buffer, *state, D3D12_RESOURCE_STATE_COMMON))
+            .collect();
+        if !barriers.is_empty() {
+            // SAFETY: the state map keeps all named buffers alive until reset.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -882,6 +942,10 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.shadow_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1107,24 +1171,25 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
+    /// Reset on the GPU so two executions of the same recorded list in one
+    /// submission each start with their own budget.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+        let (buffer, zero) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                let host = host()?;
+                let (b, _) = host.shared_buffer(4)?;
+                let (zero, data) = host.upload_buffer(4)?;
+                // SAFETY: the upload is mapped and has room for one dword.
+                unsafe { data.cast::<u32>().write(0) };
+                Some((b, zero))
             })
             .as_ref()?;
-        let mut deferred = self.deferred();
-        if !deferred.budget_zeroed {
-            deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+        if !std::mem::replace(&mut self.deferred().budget_zeroed, true) {
+            self.shadow_state(buffer, D3D12_RESOURCE_STATE_COPY_DEST);
+            // SAFETY: both buffers stay alive with the list.
+            unsafe { self.list.CopyBufferRegion(buffer, 0, zero, 0, 4) };
+            self.shadow_state(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
